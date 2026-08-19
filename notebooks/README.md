@@ -38,7 +38,8 @@ Bronze itself is never pruned: there is no `UPDATE` and deliberately no
    databricks secrets put-secret digest-backups age-identity   # AGE-SECRET-KEY-1...
    ```
    Set the `age_mode` widget to `identity` for an X25519 key, or `passphrase` if the
-   export was encrypted with `age -p`. Both paths are implemented and tested.
+   export was encrypted with `age -p`. Both decrypt paths were verified locally against
+   `pyrage` 1.3.0 with a real encrypt/decrypt round-trip.
 3. Catalog, schema and staging volume are created by the notebook if absent.
 
 ## Widgets
@@ -53,6 +54,7 @@ Bronze itself is never pruned: there is no `UPDATE` and deliberately no
 | `lookback_days` | `7` | keep aligned with S3 retention |
 | `merge_key` | `_row_hash` | see below |
 | `fail_on_missing_today` | `true` | set `false` for a backfill run |
+| `checkpoint_root` | *(blank)* | blank = staging volume; see below |
 
 ### `merge_key`
 
@@ -74,6 +76,21 @@ Adjust `schedule.quartz_cron_expression` so it fires *after* the upstream export
 The job uses `max_concurrent_runs: 1` — overlapping runs would contend on the Auto
 Loader checkpoint.
 
+## What is and isn't verified
+
+The age decryption (both key modes), the Python syntax and the job JSON were checked
+locally. **Nothing has been run against Databricks** — the UC external location, the
+Volumes I/O, the Auto Loader stream and the MERGE are unexercised. Watch the first run
+for two things in particular:
+
+- **Checkpoint on a Volume.** Streaming checkpoints need rename semantics that
+  object-storage-backed Volumes don't always provide. If the stream errors on the
+  checkpoint, set the `checkpoint_root` widget to an external location such as
+  `s3://shira-digest-backups/_checkpoints/bronze_msg/` (needs write access). That path
+  also survives the Volume being recreated.
+- **Staging rename.** The decrypt writes `*.partial` then renames. `os.replace` is tried
+  first with a `dbutils.fs.mv` fallback for the same reason.
+
 ## Operating notes
 
 - **`_rescued_data`** is non-null when the export gains or malforms a column. The run
@@ -86,3 +103,8 @@ Loader checkpoint.
   a bigger driver if the export grows.
 - **Backfill** beyond 7 days is only possible if the files still exist. Raise
   `lookback_days` and set `fail_on_missing_today=false`.
+- **Table layout:** bronze is created with `CLUSTER BY (_row_hash)`. The merge predicate
+  is a hash, so file-level min/max stats prune almost nothing — without clustering the
+  daily MERGE degrades into a full-table scan as the table grows. If you switch
+  `merge_key` to a business key, re-cluster on that column too.
+

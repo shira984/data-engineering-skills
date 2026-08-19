@@ -42,6 +42,10 @@ dbutils.widgets.dropdown("age_mode", "identity", ["identity", "passphrase"], "8.
 dbutils.widgets.text("lookback_days", "7", "9. Lookback days")
 dbutils.widgets.text("merge_key", "_row_hash", "10. Merge key column")
 dbutils.widgets.dropdown("fail_on_missing_today", "true", ["true", "false"], "11. Fail if today missing")
+# Streaming checkpoints on UC Volumes depend on rename semantics that object storage
+# does not always provide. If the stream errors on the checkpoint, repoint this at an
+# external location, e.g. s3://shira-digest-backups/_checkpoints/bronze_msg/.
+dbutils.widgets.text("checkpoint_root", "", "12. Checkpoint root (blank = volume)")
 
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
@@ -59,7 +63,7 @@ FQN = f"`{CATALOG}`.`{SCHEMA}`.`{TABLE}`"
 VOLUME_ROOT = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/{TABLE}"
 STAGING_ROOT = f"{VOLUME_ROOT}/staged"
 SCHEMA_ROOT = f"{VOLUME_ROOT}/_schema"
-CHECKPOINT_ROOT = f"{VOLUME_ROOT}/_checkpoint"
+CHECKPOINT_ROOT = dbutils.widgets.get("checkpoint_root").rstrip("/") or f"{VOLUME_ROOT}/_checkpoint"
 
 print(f"target      : {FQN}")
 print(f"source      : {S3_ROOT}/dt=*/")
@@ -114,7 +118,7 @@ else:
 
 
 def partition_dates(lookback: int):
-    """Most recent first, so a missing today is detected before older work happens."""
+    """The lookback window, most recent first."""
     today = _dt.date.today()
     return [today - _dt.timedelta(days=offset) for offset in range(lookback)]
 
@@ -173,11 +177,17 @@ for day in partition_dates(LOOKBACK_DAYS):
                     f"'{AGE_MODE}' matches how the file was encrypted."
                 ) from exc
 
+            # Write via a .partial name so a crash mid-write never leaves a truncated
+            # file that Auto Loader would happily ingest. os.replace is atomic on POSIX
+            # but Volumes are object-storage backed, so fall back to dbutils.fs.mv.
             os.makedirs(dest_dir, exist_ok=True)
             tmp_dest = f"{dest}.partial"
             with open(tmp_dest, "wb") as fh:
                 fh.write(plaintext)
-            os.replace(tmp_dest, dest)  # only a complete file ever appears at `dest`
+            try:
+                os.replace(tmp_dest, dest)
+            except OSError:
+                dbutils.fs.mv(f"dbfs:{tmp_dest}", f"dbfs:{dest}")
             staged.append(dest)
         finally:
             if os.path.exists(local_encrypted):
@@ -248,27 +258,34 @@ def with_metadata(df):
 def upsert_batch(batch_df, batch_id):
     batch_df = with_metadata(batch_df)
 
-    # Dedup within the batch: with an insert-only MERGE, two identical source rows would
-    # both be inserted, since neither matches the target at plan time.
-    batch_df = batch_df.dropDuplicates([MERGE_KEY])
-
-    if not spark.catalog.tableExists(f"{CATALOG}.{SCHEMA}.{TABLE}"):
-        (
-            batch_df.limit(0).write.format("delta")
-            .option("delta.enableChangeDataFeed", "true")
-            .saveAsTable(f"{CATALOG}.{SCHEMA}.{TABLE}")
+    if MERGE_KEY not in batch_df.columns:
+        raise ValueError(
+            f"merge_key '{MERGE_KEY}' is not a column in the source. Available: "
+            f"{sorted(batch_df.columns)}"
         )
 
-    target = DeltaTable.forName(spark, f"{CATALOG}.{SCHEMA}.{TABLE}")
-    (
-        target.alias("t")
-        .merge(batch_df.alias("s"), f"t.`{MERGE_KEY}` = s.`{MERGE_KEY}`")
-        .whenNotMatchedInsertAll()
-        # No whenMatchedUpdate: bronze rows are immutable once landed.
-        # No whenNotMatchedBySourceDelete: rows aged out of S3 must survive in bronze.
-        .execute()
-    )
-    print(f"batch {batch_id}: merged {batch_df.count()} candidate rows")
+    # Dedup within the batch: with an insert-only MERGE, two identical source rows would
+    # both be inserted, since neither matches the target at plan time.
+    batch_df = batch_df.dropDuplicates([MERGE_KEY]).persist()  # 3 actions below
+    try:
+        if not spark.catalog.tableExists(f"{CATALOG}.{SCHEMA}.{TABLE}"):
+            batch_df.limit(0).write.format("delta").saveAsTable(f"{CATALOG}.{SCHEMA}.{TABLE}")
+            # The merge predicate is a hash, so min/max file stats prune almost nothing.
+            # Cluster on it or the daily MERGE degrades into a full-table scan as bronze grows.
+            spark.sql(f"ALTER TABLE {FQN} CLUSTER BY (`{MERGE_KEY}`)")
+
+        target = DeltaTable.forName(spark, f"{CATALOG}.{SCHEMA}.{TABLE}")
+        (
+            target.alias("t")
+            .merge(batch_df.alias("s"), f"t.`{MERGE_KEY}` = s.`{MERGE_KEY}`")
+            .whenNotMatchedInsertAll()
+            # No whenMatchedUpdate: bronze rows are immutable once landed.
+            # No whenNotMatchedBySourceDelete: rows aged out of S3 must survive in bronze.
+            .execute()
+        )
+        print(f"batch {batch_id}: merged {batch_df.count()} candidate rows")
+    finally:
+        batch_df.unpersist()
 
 
 query = (
@@ -285,6 +302,14 @@ print("stream finished:", query.lastProgress)
 # MAGIC %md ## 4. Post-load verification
 
 # COMMAND ----------
+
+# On a first-ever run where no partition existed, no batch ran and the table was never
+# created. Say so plainly rather than failing with TABLE_OR_VIEW_NOT_FOUND.
+if not spark.catalog.tableExists(f"{CATALOG}.{SCHEMA}.{TABLE}"):
+    dbutils.notebook.exit(
+        f"No data loaded and {FQN} does not exist yet — no source partitions were found "
+        f"in the last {LOOKBACK_DAYS} days under {S3_ROOT}."
+    )
 
 summary = spark.sql(f"""
     SELECT _dt,
